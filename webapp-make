@@ -2,6 +2,8 @@
 # webapp-make
 set -eu
 
+VERSION="1.0.0"
+
 detect_browser() {
   for b in vivaldi-stable vivaldi brave brave-browser chromium chromium-browser google-chrome; do
     if command -v "$b" >/dev/null 2>&1; then
@@ -277,6 +279,11 @@ Usage:
 EOF
 }
 
+case "${1:-}" in
+  -v|--version) echo "webapp-make $VERSION"; exit 0 ;;
+  -h|--help) print_usage; exit 0 ;;
+esac
+
 URL="${1:-}"
 if [ -z "${URL}" ]; then
   if command -v wl-paste >/dev/null 2>&1; then
@@ -318,6 +325,10 @@ while [ $# -gt 0 ]; do
   --desktop-dir)
     shift
     DESKTOP_DIR="${1:-}"
+    ;;
+  -v | --version)
+    echo "webapp-make $VERSION"
+    exit 0
     ;;
   -h | --help)
     print_usage
