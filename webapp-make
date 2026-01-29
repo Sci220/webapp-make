@@ -1,0 +1,434 @@
+#!/usr/bin/env sh
+# webapp-make
+set -eu
+
+detect_browser() {
+  for b in vivaldi-stable vivaldi brave brave-browser chromium chromium-browser google-chrome; do
+    if command -v "$b" >/dev/null 2>&1; then
+      echo "$b"
+      return 0
+    fi
+  done
+  if command -v firefox >/dev/null 2>&1; then
+    echo "firefox"
+    return 0
+  fi
+  echo "none"
+  return 1
+}
+
+slugify() {
+  printf "%s" "$1" |
+    tr '[:upper:]' '[:lower:]' |
+    sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+get_desktop_dir() {
+  if command -v xdg-user-dir >/dev/null 2>&1; then
+    d="$(xdg-user-dir DESKTOP 2>/dev/null || true)"
+    if [ -n "${d:-}" ] && [ -d "$d" ]; then
+      printf "%s\n" "$d"
+      return 0
+    fi
+  fi
+  if [ -d "$HOME/Desktop" ]; then
+    printf "%s\n" "$HOME/Desktop"
+  else
+    mkdir -p "$HOME/Desktop"
+    printf "%s\n" "$HOME/Desktop"
+  fi
+}
+
+guess_name_from_url() {
+  u="$1"
+  host="$(printf "%s" "$u" | sed -E 's|^[a-zA-Z]+://||; s|/.*$||')"
+  host="$(printf "%s" "$host" | sed -E 's/^www[0-9]*\.//')"
+  title="$(printf "%s" "$host" | tr '.' ' ' | tr '-' ' ' | awk '{for(i=1;i<=NF;i++){ $i=toupper(substr($i,1,1)) substr($i,2) }}1')"
+  printf "%s\n" "$title"
+}
+
+fetch_url() {
+  # Fetch URL content to stdout
+  url="$1"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 10 "$url" 2>/dev/null && return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=10 "$url" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+fetch_to_file() {
+  # Fetch URL content to file
+  url="$1"
+  out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --max-time 15 "$url" -o "$out" 2>/dev/null && return 0
+  fi
+  if command -v wget >/dev/null 2>&1; then
+    wget -qO "$out" --timeout=15 "$url" 2>/dev/null && return 0
+  fi
+  return 1
+}
+
+get_base_url() {
+  # Extract base URL (protocol + host) from full URL
+  printf "%s" "$1" | sed -E 's|(^[a-zA-Z]+://[^/]+).*|\1|'
+}
+
+resolve_url() {
+  # Resolve potentially relative URL against base
+  base="$1"
+  url="$2"
+  case "$url" in
+    http://*|https://*)
+      # Already absolute
+      printf "%s" "$url"
+      ;;
+    //*)
+      # Protocol-relative
+      proto="$(printf "%s" "$base" | sed -E 's|^([a-zA-Z]+)://.*|\1|')"
+      printf "%s:%s" "$proto" "$url"
+      ;;
+    /*)
+      # Root-relative
+      base_url="$(get_base_url "$base")"
+      printf "%s%s" "$base_url" "$url"
+      ;;
+    *)
+      # Relative path
+      base_url="$(get_base_url "$base")"
+      printf "%s/%s" "$base_url" "$url"
+      ;;
+  esac
+}
+
+parse_json_string() {
+  # Extract string value for a key from JSON (basic, no jq needed)
+  # Usage: parse_json_string "key" < json_content
+  key="$1"
+  # Match "key": "value" or "key":"value", handle escaped quotes
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\"\([^\"]*\)\".*/\1/p" | head -1
+}
+
+parse_json_array_strings() {
+  # Extract array of objects, output one per line
+  # Very basic - extracts content between [ and ]
+  key="$1"
+  sed -n "s/.*\"${key}\"[[:space:]]*:[[:space:]]*\[\([^]]*\)\].*/\1/p" | head -1
+}
+
+fetch_manifest() {
+  # Fetch PWA manifest and extract name/icon info
+  # Sets: MANIFEST_NAME, MANIFEST_ICON_URL
+  # Returns 0 if manifest found, 1 otherwise
+  page_url="$1"
+  tmp_html="$(mktemp)"
+  tmp_manifest="$(mktemp)"
+
+  MANIFEST_NAME=""
+  MANIFEST_ICON_URL=""
+
+  # Fetch the HTML page
+  if ! fetch_url "$page_url" > "$tmp_html" 2>/dev/null; then
+    rm -f "$tmp_html" "$tmp_manifest"
+    return 1
+  fi
+
+  # Look for manifest link: <link rel="manifest" href="...">
+  manifest_href="$(grep -oiE '<link[^>]+rel=["\x27]manifest["\x27][^>]*>' "$tmp_html" | \
+    grep -oiE 'href=["\x27][^"\x27]+["\x27]' | \
+    sed -E "s/href=[\"']([^\"']+)[\"']/\1/i" | head -1)"
+
+  # Also try alternate pattern: href before rel
+  if [ -z "$manifest_href" ]; then
+    manifest_href="$(grep -oiE '<link[^>]+href=[^>]+rel=["\x27]manifest["\x27][^>]*>' "$tmp_html" | \
+      grep -oiE 'href=["\x27][^"\x27]+["\x27]' | \
+      sed -E "s/href=[\"']([^\"']+)[\"']/\1/i" | head -1)"
+  fi
+
+  rm -f "$tmp_html"
+
+  if [ -z "$manifest_href" ]; then
+    # Try common manifest locations as fallback
+    base_url="$(get_base_url "$page_url")"
+    for path in "/manifest.json" "/site.webmanifest" "/manifest.webmanifest"; do
+      if fetch_url "${base_url}${path}" > "$tmp_manifest" 2>/dev/null; then
+        if grep -q '"name"' "$tmp_manifest" 2>/dev/null; then
+          manifest_href="$path"
+          break
+        fi
+      fi
+    done
+  fi
+
+  if [ -z "$manifest_href" ]; then
+    rm -f "$tmp_manifest"
+    return 1
+  fi
+
+  # Resolve manifest URL
+  manifest_url="$(resolve_url "$page_url" "$manifest_href")"
+
+  # Fetch manifest if not already fetched
+  if [ ! -s "$tmp_manifest" ]; then
+    if ! fetch_url "$manifest_url" > "$tmp_manifest" 2>/dev/null; then
+      rm -f "$tmp_manifest"
+      return 1
+    fi
+  fi
+
+  # Parse manifest - prefer jq if available, fall back to grep/sed
+  if command -v jq >/dev/null 2>&1; then
+    MANIFEST_NAME="$(jq -r '.name // .short_name // empty' "$tmp_manifest" 2>/dev/null | head -1)"
+    # Get largest icon (prefer 512, then 256, then 192, then any)
+    MANIFEST_ICON_URL="$(jq -r '
+      .icons // [] |
+      sort_by((.sizes // "0x0" | split("x")[0] | tonumber)) |
+      reverse |
+      .[0].src // empty
+    ' "$tmp_manifest" 2>/dev/null)"
+  else
+    # Fallback: basic parsing
+    MANIFEST_NAME="$(parse_json_string "name" < "$tmp_manifest")"
+    if [ -z "$MANIFEST_NAME" ]; then
+      MANIFEST_NAME="$(parse_json_string "short_name" < "$tmp_manifest")"
+    fi
+    # Try to find largest icon - look for 512, 256, 192, or just first src
+    icons_section="$(parse_json_array_strings "icons" < "$tmp_manifest")"
+    for size in 512 256 192 144 128 96; do
+      icon_match="$(printf "%s" "$icons_section" | grep -oE "\"src\"[[:space:]]*:[[:space:]]*\"[^\"]+\"[^}]*\"sizes\"[[:space:]]*:[[:space:]]*\"${size}x${size}\"" | head -1)"
+      if [ -z "$icon_match" ]; then
+        icon_match="$(printf "%s" "$icons_section" | grep -oE "\"sizes\"[[:space:]]*:[[:space:]]*\"${size}x${size}\"[^}]*\"src\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" | head -1)"
+      fi
+      if [ -n "$icon_match" ]; then
+        MANIFEST_ICON_URL="$(printf "%s" "$icon_match" | grep -oE "\"src\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" | sed -E 's/"src"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/')"
+        break
+      fi
+    done
+    # Fallback: just get first icon src
+    if [ -z "$MANIFEST_ICON_URL" ]; then
+      MANIFEST_ICON_URL="$(printf "%s" "$icons_section" | grep -oE "\"src\"[[:space:]]*:[[:space:]]*\"[^\"]+\"" | head -1 | sed -E 's/"src"[[:space:]]*:[[:space:]]*"([^"]+)"/\1/')"
+    fi
+  fi
+
+  # Resolve icon URL if found
+  if [ -n "$MANIFEST_ICON_URL" ]; then
+    MANIFEST_ICON_URL="$(resolve_url "$manifest_url" "$MANIFEST_ICON_URL")"
+  fi
+
+  rm -f "$tmp_manifest"
+
+  # Return success if we found at least a name
+  [ -n "$MANIFEST_NAME" ] || [ -n "$MANIFEST_ICON_URL" ]
+}
+
+fetch_icon() {
+  out="$1"
+  url="$2"
+  manifest_icon="${3:-}"
+
+  # Try manifest icon first (usually higher quality)
+  if [ -n "$manifest_icon" ]; then
+    if fetch_to_file "$manifest_icon" "$out"; then
+      # Verify it's actually an image (basic check)
+      if file "$out" 2>/dev/null | grep -qiE '(image|icon|PNG|JPEG|SVG)'; then
+        return 0
+      fi
+    fi
+  fi
+
+  # Try direct favicon.ico
+  base_url="$(get_base_url "$url")"
+  if fetch_to_file "${base_url}/favicon.ico" "$out"; then
+    if file "$out" 2>/dev/null | grep -qiE '(image|icon)'; then
+      return 0
+    fi
+  fi
+
+  # Try apple-touch-icon (often high quality)
+  if fetch_to_file "${base_url}/apple-touch-icon.png" "$out"; then
+    if file "$out" 2>/dev/null | grep -qiE '(image|PNG)'; then
+      return 0
+    fi
+  fi
+
+  # Fallback to Google's favicon service
+  host="$(printf "%s" "$url" | sed -E 's|^[a-zA-Z]+://||; s|/.*$||; s/:.*$//')"
+  s2="https://www.google.com/s2/favicons?domain=${host}&sz=128"
+  if fetch_to_file "$s2" "$out"; then
+    return 0
+  fi
+
+  # Try DuckDuckGo as last resort
+  ddg="https://icons.duckduckgo.com/ip3/${host}.ico"
+  if fetch_to_file "$ddg" "$out"; then
+    return 0
+  fi
+
+  return 1
+}
+
+print_usage() {
+  cat <<EOF
+Usage:
+  webapp-make URL [--name "Title"] [--browser brave|chromium|firefox] [--class WMClass] [--isolate] [--desktop-dir PATH]
+EOF
+}
+
+URL="${1:-}"
+if [ -z "${URL}" ]; then
+  if command -v wl-paste >/dev/null 2>&1; then
+    URL="$(wl-paste -n 2>/dev/null || true)"
+  fi
+  if [ -z "${URL}" ]; then
+    printf "Enter URL: "
+    IFS= read -r URL
+  fi
+fi
+[ -n "$URL" ] || {
+  echo "No URL provided." >&2
+  print_usage
+  exit 1
+}
+shift || true
+
+NAME=""
+BROWSER="$(detect_browser || true)"
+WMCLASS=""
+ISOLATE="no"
+DESKTOP_DIR="$(get_desktop_dir)"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+  --name)
+    shift
+    NAME="${1:-}"
+    ;;
+  --browser)
+    shift
+    BROWSER="${1:-}"
+    ;;
+  --class)
+    shift
+    WMCLASS="${1:-}"
+    ;;
+  --isolate) ISOLATE="yes" ;;
+  --desktop-dir)
+    shift
+    DESKTOP_DIR="${1:-}"
+    ;;
+  -h | --help)
+    print_usage
+    exit 0
+    ;;
+  *)
+    echo "Unknown option: $1" >&2
+    print_usage
+    exit 1
+    ;;
+  esac
+  shift || true
+
+done
+
+[ "${BROWSER}" != "none" ] || {
+  echo "No supported browser found." >&2
+  exit 1
+}
+
+BROWSER_BIN="$(command -v "$BROWSER" || true)"
+[ -n "${BROWSER_BIN}" ] || {
+  echo "Browser not found in PATH at runtime." >&2
+  exit 1
+}
+
+if ! printf "%s" "$URL" | grep -Eq '^[a-zA-Z]+://'; then
+  URL="https://$URL"
+fi
+
+# Try to fetch PWA manifest for better name and icon
+MANIFEST_NAME=""
+MANIFEST_ICON_URL=""
+printf "Checking for PWA manifest... "
+if fetch_manifest "$URL"; then
+  printf "found\n"
+  [ -n "$MANIFEST_NAME" ] && printf "  App name: %s\n" "$MANIFEST_NAME"
+  [ -n "$MANIFEST_ICON_URL" ] && printf "  Icon: %s\n" "$MANIFEST_ICON_URL"
+else
+  printf "not found\n"
+fi
+
+# Use manifest name if available and no --name was provided
+if [ -z "${NAME}" ]; then
+  if [ -n "$MANIFEST_NAME" ]; then
+    NAME="$MANIFEST_NAME"
+  else
+    NAME="$(guess_name_from_url "$URL")"
+  fi
+fi
+SLUG="$(slugify "$NAME")"
+APP_ID="webapp-${SLUG}"
+
+BASE_DIR="$HOME/.local/share/webapps/${SLUG}"
+ICON_PATH="${BASE_DIR}/icon.png"
+DESKTOP_FILE="${DESKTOP_DIR}/${APP_ID}.desktop"
+APP_DIR="$HOME/.local/share/applications"
+
+mkdir -p "$BASE_DIR" "$APP_DIR"
+
+[ -n "${WMCLASS}" ] || WMCLASS="${APP_ID}"
+
+OZONE="--ozone-platform=wayland"
+PROFILE_ARG=""
+CLASS_ARG=""
+case "$BROWSER" in
+brave | brave-browser | chromium | chromium-browser | google-chrome | vivaldi*)
+  [ "${ISOLATE}" = "yes" ] && PROFILE_ARG="--user-data-dir=${BASE_DIR}/profile"
+  CLASS_ARG="--class=${WMCLASS}"
+  EXEC_LINE="${BROWSER_BIN} --new-window ${OZONE} ${CLASS_ARG} ${PROFILE_ARG} --app=${URL}"
+  ;;
+firefox)
+  CLASS_ARG=""
+  [ -n "${WMCLASS}" ] && CLASS_ARG="--class ${WMCLASS}"
+  EXEC_LINE="${BROWSER_BIN} --new-window ${CLASS_ARG} ${URL}"
+  ;;
+*)
+  EXEC_LINE="${BROWSER_BIN} ${URL}"
+  ;;
+esac
+
+printf "Fetching icon... "
+if fetch_icon "$ICON_PATH" "$URL" "$MANIFEST_ICON_URL"; then
+  ICON_FIELD="$ICON_PATH"
+  printf "done\n"
+else
+  ICON_FIELD="web-browser"
+  printf "using default\n"
+fi
+
+cat >"$DESKTOP_FILE" <<EOF
+[Desktop Entry]
+Name=${NAME}
+GenericName=Web App
+Comment=${NAME}
+Exec=${EXEC_LINE}
+TryExec=${BROWSER_BIN}
+Terminal=false
+Type=Application
+Icon=${ICON_FIELD}
+Categories=Network;WebBrowser;
+StartupWMClass=${WMCLASS}
+DBusActivatable=false
+EOF
+
+cp -f "$DESKTOP_FILE" "$APP_DIR/${APP_ID}.desktop"
+chmod +x "$DESKTOP_FILE" || true
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true
+fi
+
+printf "Created: %s\n" "$DESKTOP_FILE"
+printf "Exec:    %s\n" "$EXEC_LINE"
