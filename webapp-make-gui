@@ -60,7 +60,18 @@ def get_existing_webapps():
 
             # Extract URL from Exec line
             url_match = re.search(r'--app=(https?://[^\s]+)', exec_cmd)
+            if not url_match:
+                url_match = re.search(r'(https?://[^\s]+)\s*$', exec_cmd)
             url = url_match.group(1) if url_match else ''
+
+            # Browser command from Exec line first token
+            browser_cmd = os.path.basename(exec_cmd.split()[0]) if exec_cmd else ''
+
+            # Isolate: presence of --user-data-dir=
+            isolate = '--user-data-dir=' in exec_cmd
+
+            # WMClass from desktop entry
+            wmclass = entry.get('StartupWMClass', '')
 
             # Get slug from filename
             slug = desktop_file.stem.replace('webapp-', '')
@@ -71,6 +82,9 @@ def get_existing_webapps():
                 'icon': icon,
                 'url': url,
                 'desktop_file': str(desktop_file),
+                'browser': browser_cmd,
+                'isolate': isolate,
+                'wmclass': wmclass,
             })
         except Exception:
             continue
@@ -188,13 +202,14 @@ def guess_name_from_url(url):
 class CreateDialog(Adw.Dialog):
     """Dialog for creating a new web app."""
 
-    def __init__(self, parent, browsers, on_created_callback):
+    def __init__(self, parent, browsers, on_created_callback, webapp=None):
         super().__init__()
         self.parent_window = parent
         self.browsers = browsers
         self.on_created = on_created_callback
+        self.editing_webapp = webapp
 
-        self.set_title("Create Web App")
+        self.set_title("Edit Web App" if webapp else "Create Web App")
         self.set_content_width(450)
         self.set_content_height(400)
 
@@ -211,7 +226,7 @@ class CreateDialog(Adw.Dialog):
         cancel_btn.connect('clicked', lambda _: self.close())
         header.pack_start(cancel_btn)
 
-        self.create_btn = Gtk.Button(label="Create")
+        self.create_btn = Gtk.Button(label="Save" if webapp else "Create")
         self.create_btn.add_css_class('suggested-action')
         self.create_btn.connect('clicked', self.on_create_clicked)
         self.create_btn.set_sensitive(False)
@@ -269,7 +284,10 @@ class CreateDialog(Adw.Dialog):
         self.browser_row.set_title("Browser")
 
         browser_model = Gtk.StringList()
-        browser_model.append("Auto-detect")
+        auto_label = "Auto-detect"
+        if self.browsers:
+            auto_label = f"Auto-detect ({self.browsers[0][1]})"
+        browser_model.append(auto_label)
         for cmd, name in self.browsers:
             browser_model.append(name)
         self.browser_row.set_model(browser_model)
@@ -295,8 +313,27 @@ class CreateDialog(Adw.Dialog):
         self.wmclass_row.set_title("Window Class")
         self.advanced_expander.add_row(self.wmclass_row)
 
-        # Try to paste URL from clipboard on open
-        GLib.idle_add(self.try_clipboard_paste)
+        # Pre-fill fields in edit mode, otherwise try clipboard paste
+        if webapp:
+            self.url_row.set_text(webapp.get('url', ''))
+            self.name_row.set_text(webapp.get('name', ''))
+
+            # Pre-select browser in dropdown
+            browser_cmd = webapp.get('browser', '')
+            browser_index = 0  # Auto-detect
+            for i, (cmd, _name) in enumerate(self.browsers):
+                if cmd == browser_cmd:
+                    browser_index = i + 1  # +1 for Auto-detect entry
+                    break
+            self.browser_row.set_selected(browser_index)
+
+            self.isolate_row.set_active(webapp.get('isolate', False))
+            wmclass = webapp.get('wmclass', '')
+            if wmclass:
+                self.advanced_expander.set_expanded(True)
+                self.wmclass_row.set_text(wmclass)
+        else:
+            GLib.idle_add(self.try_clipboard_paste)
 
     def try_clipboard_paste(self):
         """Try to get URL from clipboard on dialog open."""
@@ -365,12 +402,20 @@ class CreateDialog(Adw.Dialog):
         isolate = self.isolate_row.get_active()
         wmclass = self.wmclass_row.get_text().strip() or None
 
-        # Disable button during creation
+        # Disable button during operation
         self.create_btn.set_sensitive(False)
-        self.create_btn.set_label("Creating...")
+        editing = self.editing_webapp
+        self.create_btn.set_label("Saving..." if editing else "Creating...")
 
         # Run in thread to avoid blocking UI
         def do_create():
+            # In edit mode, delete the old app first
+            if editing:
+                del_ok, del_errors = delete_webapp(editing['slug'])
+                if not del_ok:
+                    GLib.idle_add(self.on_create_finished, False,
+                                  f"Failed to remove old app: {', '.join(del_errors)}")
+                    return
             success, message = create_webapp(url, name, browser, isolate, wmclass)
             GLib.idle_add(self.on_create_finished, success, message)
 
@@ -381,7 +426,7 @@ class CreateDialog(Adw.Dialog):
 
     def on_create_finished(self, success, message):
         """Handle creation result."""
-        self.create_btn.set_label("Create")
+        self.create_btn.set_label("Save" if self.editing_webapp else "Create")
         self.create_btn.set_sensitive(True)
 
         if success:
@@ -498,6 +543,14 @@ class MainWindow(Adw.ApplicationWindow):
                     icon.set_pixel_size(32)
                     row.add_prefix(icon)
 
+                # Edit button
+                edit_btn = Gtk.Button(icon_name="document-edit-symbolic")
+                edit_btn.set_valign(Gtk.Align.CENTER)
+                edit_btn.add_css_class('flat')
+                edit_btn.set_tooltip_text("Edit web app")
+                edit_btn.connect('clicked', self.on_edit_clicked, webapp)
+                row.add_suffix(edit_btn)
+
                 # Delete button
                 delete_btn = Gtk.Button(icon_name="user-trash-symbolic")
                 delete_btn.set_valign(Gtk.Align.CENTER)
@@ -525,6 +578,12 @@ class MainWindow(Adw.ApplicationWindow):
         dialog = CreateDialog(self, browsers, self.on_webapp_created)
         dialog.present(self)
 
+    def on_edit_clicked(self, button, webapp):
+        """Show edit dialog pre-filled with existing webapp data."""
+        browsers = get_installed_browsers()
+        dialog = CreateDialog(self, browsers, self.on_webapp_updated, webapp=webapp)
+        dialog.present(self)
+
     def on_webapp_created(self, success, message):
         """Handle webapp creation result."""
         if success:
@@ -532,6 +591,14 @@ class MainWindow(Adw.ApplicationWindow):
             self.refresh_apps_list()
         else:
             self.show_toast(f"Failed to create: {message}")
+
+    def on_webapp_updated(self, success, message):
+        """Handle webapp update result."""
+        if success:
+            self.show_toast("Web app updated successfully")
+            self.refresh_apps_list()
+        else:
+            self.show_toast(f"Failed to update: {message}")
 
     def on_delete_clicked(self, button, webapp):
         """Show delete confirmation dialog."""
